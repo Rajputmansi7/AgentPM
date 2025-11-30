@@ -1,0 +1,6 @@
+streamlit>=1.22
+google-generativeai
+duckduckgo_search
+pandas
+python-dotenv
+asyncio
