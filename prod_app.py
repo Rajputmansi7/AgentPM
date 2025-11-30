@@ -1,4 +1,4 @@
-# app.py — AgentPM (Merged, deployment-ready)
+# prod_app.py — AgentPM (Merged, deployment-ready) — updated
 import streamlit as st
 import asyncio
 import os
@@ -8,10 +8,22 @@ import logging
 import inspect
 import google.generativeai as genai
 from typing import Dict, Any, List, Tuple
-from difflib import SequenceMatcher 
-from duckduckgo_search import DDGS
+from difflib import SequenceMatcher
 import ast
 import pandas as pd
+import warnings
+
+# Suppress the noisy deprecation warning from older duckduckgo_search package if present
+warnings.filterwarnings("ignore", message=".*duckduckgo_search.*renamed to `ddgs`.*")
+
+# Prefer the new ddgs package; fallback to duckduckgo_search if needed
+try:
+    from ddgs import DDGS
+except Exception:
+    try:
+        from duckduckgo_search import DDGS
+    except Exception:
+        DDGS = None  # we'll handle missing package gracefully
 
 import os
 from dotenv import load_dotenv
@@ -31,7 +43,6 @@ def get_gemini_key():
     return os.getenv("GEMINI_API_KEY")
 
 api_key = get_gemini_key()
-
 
 # ------------------------
 # Config & Working Dir
@@ -106,10 +117,10 @@ class MemoryBank:
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[:top_k]
 
-# init
-if "memory" not in st.session_state:
+# init (ensure types are correct even if stale state persisted)
+if "memory" not in st.session_state or not isinstance(st.session_state.memory, MemoryBank):
     st.session_state.memory = MemoryBank()
-if "sessions" not in st.session_state:
+if "sessions" not in st.session_state or not isinstance(st.session_state.sessions, InMemorySessionService):
     st.session_state.sessions = InMemorySessionService()
 
 # ------------------------
@@ -130,10 +141,23 @@ class ToolRegistry:
                     return await func(*args)
                 return func(*args)
             except Exception as e:
+                ui_log("system", f"Tool {tool_name} execution error: {e}")
                 return f"Tool execution error: {e}"
         return f"Tool {tool_name} not found."
 
 tool_registry = ToolRegistry()
+
+# ------------------------
+# DDGS client single instance (avoid repeated init + deprecation spam)
+# ------------------------
+_ddgs_client = None
+def get_ddgs_client():
+    global _ddgs_client
+    if _ddgs_client is None:
+        if DDGS is None:
+            raise RuntimeError("DDGS (duckduckgo search) client not available. Install 'ddgs' package.")
+        _ddgs_client = DDGS()
+    return _ddgs_client
 
 # ------------------------
 # Real DuckDuckGo Search Tool (from App2), cleaned output (English oriented)
@@ -145,11 +169,10 @@ def duckduckgo_search(query: str, max_results: int = 6) -> str:
     Returns a cleaned, English-friendly multi-line summary suitable for LLM consumption.
     """
     try:
-        ddgs = DDGS()
+        ddgs = get_ddgs_client()
         results = list(ddgs.text(query, max_results=max_results))
         # fallback: broaden query if empty
         if not results:
-            # try a broader form (remove punctuation, split tokens)
             fallback_q = " ".join([t for t in query.replace("/", " ").split() if len(t) > 2])
             results = list(ddgs.text(fallback_q, max_results=max_results))
         if not results:
@@ -163,8 +186,8 @@ def duckduckgo_search(query: str, max_results: int = 6) -> str:
             items.append(f"- {preview}: {body[:240]}")
         return "REAL WEB RESULTS (English summary):\n" + "\n".join(items)
     except Exception as e:
+        ui_log("system", f"duckduckgo_search error: {e}")
         return f"Search failed: {e}"
-
 
 # ------------------------
 # Safe calculator (security: avoid eval) — use ast.literal_eval
@@ -173,14 +196,16 @@ def duckduckgo_search(query: str, max_results: int = 6) -> str:
 def calculator(expression: str) -> str:
     """Safe calculator (supports numeric expressions)."""
     try:
-        # ast.literal_eval only supports literals, so we try simple math via eval but with safety:
-        # implement a tiny parser using ast (restrict to math ops)
         import ast, operator as op
-        # supported operators
         operators = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
                      ast.Pow: op.pow, ast.USub: op.neg, ast.Mod: op.mod}
         def eval_expr(node):
-            if isinstance(node, ast.Num): return node.n
+            if isinstance(node, ast.Constant):  # Python 3.8+ uses Constant
+                if isinstance(node.value, (int, float)):
+                    return node.value
+                raise ValueError("Unsupported literal")
+            if isinstance(node, ast.Num):  # older AST node
+                return node.n
             if isinstance(node, ast.BinOp):
                 return operators[type(node.op)](eval_expr(node.left), eval_expr(node.right))
             if isinstance(node, ast.UnaryOp):
@@ -196,7 +221,6 @@ def calculator(expression: str) -> str:
 # ------------------------
 GEMINI_AVAILABLE = False
 try:
-    # configure if key present in env; callers may pass key also
     if os.environ.get("GEMINI_API_KEY"):
         genai.configure(api_key=os.environ["GEMINI_API_KEY"])
         GEMINI_AVAILABLE = True
@@ -207,16 +231,19 @@ class LLMClient:
     def __init__(self, api_key: str = None, model_name: str = "models/gemini-2.5-flash"):
         self.model_name = model_name
         if api_key:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(model_name)
-            self.available = True
+            try:
+                genai.configure(api_key=api_key)
+                self.model = genai.GenerativeModel(model_name)
+                self.available = True
+            except Exception as e:
+                ui_log("system", f"Failed to configure Gemini client: {e}")
+                self.available = False
+                self.model = None
         else:
-            # fallback: use global env config if present
             self.available = GEMINI_AVAILABLE
             self.model = genai.GenerativeModel(model_name) if GEMINI_AVAILABLE else None
 
     async def generate(self, system_prompt: str, user_prompt: str, context: str) -> str:
-        # Use a controlled protocol; agent can output TOOL_CALL: tool(arg)
         tool_instructions = """
 PROTOCOL:
 - If you need to use a tool, output exactly this line (no extra text):
@@ -230,8 +257,9 @@ PROTOCOL:
                 resp = await self.model.generate_content_async(full_prompt)
                 return resp.text
             except Exception as e:
+                ui_log("system", f"LLM client generate error: {e}")
                 return f"[LLM error]: {e}"
-        # fallback mock (keeps outputs English and concise)
+        # fallback mock
         return f"[MOCK LLM reply to]: {user_prompt[:240]}"
 
 # ------------------------
@@ -239,7 +267,7 @@ PROTOCOL:
 # ------------------------
 async def context_compactor(session_id: str, max_chars: int = 2000) -> str:
     sess = st.session_state.sessions.get(session_id, {})
-    history_str = "\n".join(sess.get("history", [])[-10:])
+    history_str = "\n".join(sess.get("history", [])[-10:]) if sess else ""
     relevant = []
     if history_str:
         sims = st.session_state.memory.query_similar(history_str, top_k=2)
@@ -273,7 +301,6 @@ class ResearchAgent(BaseAgent):
             session_id = message.get("session_id","default")
             # call web search tool
             tool_res = await self.tools.execute("duckduckgo_search", query)
-            # normalize to English sections similar to App1 mock
             report = f"Research results for: {query}\n\n{tool_res}"
             await self.send_to_memory(f"research:{query}", report)
             st.session_state.sessions.append_history(session_id, self.name, report)
@@ -321,7 +348,6 @@ class SpecWriterAgent(BaseAgent):
             ctx = await context_compactor(session_id)
             prompt = f"Write a developer-facing spec based on:\n{message.get('content')}"
             spec = await self.llm.generate("You are a CTO. Write specs in clear English.", prompt, ctx)
-            # create multi-section final spec similar to App1
             final_spec = f"TECHNICAL SPECIFICATION\n\n{spec}\n\n(End of Spec)"
             await self.send_to_memory("latest_spec", final_spec)
             st.session_state.sessions.append_history(session_id, self.name, final_spec)
@@ -357,29 +383,20 @@ class Orchestrator:
             msg = res
         return msg
     async def run_loop(self, name: str, message: Dict, max_iters: int = 3, session_id: str | None = None):
-        """
-        Run the named agent in a loop up to max_iters.
-        If session_id is provided, pass it into agent.handle as 'session_id'.
-        """
         msg = message
         for i in range(max_iters):
-            # build call args: if agent.handle expects session_id in message dict, include it
             if session_id is not None:
-                # ensure msg is a dict and include session_id
                 if isinstance(msg, dict):
                     msg['session_id'] = session_id
                 else:
                     msg = {"content": msg, "session_id": session_id}
             res = await self.agents[name].handle(msg)
-            # normalize res to dict with 'content'
             if not isinstance(res, dict):
                 res = {"content": res}
             if "DONE" in res.get("content", ""):
                 return res
-            # prepare next iteration message
             msg = {"content": res["content"], "session_id": session_id}
         return msg
-
 
 # ------------------------
 # Long-running op example (from App1) — pause/resume
@@ -393,11 +410,9 @@ async def long_running_research(task_id: str, query: str, total_steps: int = 5):
     else:
         current = 0
     for step in range(current, total_steps):
-        # simulate work chunk
         time.sleep(0.2)
         with open(state_file,'w') as f:
             json.dump({'current': step+1}, f)
-    # write final result
     st.session_state.memory.write(f'long_research:{task_id}', {'query': query, 'result': 'final results'})
 
 # ------------------------
@@ -440,9 +455,11 @@ with st.sidebar:
     st.divider()
     page = st.radio("Page", ["Workflow","Dashboard"])
     if st.button("Reset All"):
-        for k in ["logs","traces","evals"]:
+        # reset simple collections
+        for k in ["logs", "traces", "evals"]:
             st.session_state[k] = []
-        st.session_state.sessions = {}
+        # re-create the session service and memory bank objects (important!)
+        st.session_state.sessions = InMemorySessionService()
         st.session_state.memory = MemoryBank()
         st.rerun()
 
@@ -484,6 +501,7 @@ if page == "Workflow":
             for agent in [r,c,p,s,m]:
                 orch.register_agent(agent)
             sid = "sess_main"
+            # ensure session exists
             st.session_state.sessions.create(sid)
             async def run_phase():
                 ui_log("system","--- Phase 1: Parallel Research ---")
@@ -527,7 +545,6 @@ if page == "Workflow":
                 qa_res = await orch.run_loop("QA", {"content": st.session_state.spec, "session_id":"sess_main"}, session_id="sess_main")
                 ui_log("system","--- Estimation ---")
                 est_res = await est.handle({"content": qa_res['content'], "session_id":"sess_main"})
-                # compile report
                 report = compile_full_report(p_name, st.session_state.research, st.session_state.spec, qa_res['content'], est_res['content'])
                 st.session_state.final_report = report
                 ui_log("system","Project complete — report ready.")
@@ -565,5 +582,5 @@ elif page == "Dashboard":
         st.info("No ratings yet.")
 
 # ------------------------
-# End of app.py
+# End of prod_app.py
 # ------------------------
