@@ -3,3 +3,7 @@
 agentpm_state/
 __pycache__/
 .streamlit/
+agent/
+venv/
+.venv/
+env/
